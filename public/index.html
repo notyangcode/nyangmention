@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nyang Mentions - Monitor de Chats</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <script src="/socket.io/socket.io.js"></script>
+</head>
+
+<body>
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
+
+    <div class="container">
+        <header>
+            <div class="logo-area">
+                <h1>Nyang <span>Mentions</span></h1>
+                <div class="badge-live-count" id="live-indicator" style="display: none;">AO VIVO</div>
+            </div>
+            <p>Monitoramento ultra-rápido via WebSockets</p>
+        </header>
+
+        <nav class="tabs" style="display: none;">
+            <button class="tab-btn active" data-tab="live">Monitoramento Live</button>
+        </nav>
+
+        <div id="live-section" class="tab-content active">
+            <section class="status-card glass">
+                <div class="status-info">
+                    <div class="status-pulse">
+                        <span class="status-dot" id="status-dot"></span>
+                    </div>
+                    <span id="status-text">Status: Conectando...</span>
+                </div>
+                <div class="controls">
+                    <div class="toggle-sound" id="toggle-sound" title="Alternar Som">
+                        <span id="sound-icon">🔔</span>
+                    </div>
+                    <button id="btn-start" class="btn-primary">Iniciar Coleta</button>
+                    <button id="btn-stop" class="btn-secondary" disabled>Parar</button>
+                </div>
+            </section>
+
+            <div class="grid">
+                <!-- Gerenciar Streamers -->
+                <section class="card glass">
+                    <h2>Streamers</h2>
+                    <form id="streamer-form">
+                        <div class="input-wrapper">
+                            <input type="text" id="streamer-name" placeholder="Nome do Streamer" required>
+                        </div>
+                        <div class="input-group">
+                            <select id="platform" required>
+                                <option value="Twitch">Twitch</option>
+                                <option value="YouTube">YouTube</option>
+                            </select>
+                            <input type="text" id="channel-id" placeholder="ID do Canal / User" required>
+                        </div>
+                        <button type="submit" class="btn-add">Adicionar Streamer</button>
+                    </form>
+                    <div class="list" id="streamer-list">
+                        <!-- Streamers aparecem aqui -->
+                    </div>
+                </section>
+
+                <!-- Gerenciar Palavras-chave -->
+                <section class="card glass">
+                    <h2>Palavras-chave</h2>
+                    <form id="keyword-form">
+                        <div class="input-wrapper">
+                            <input type="text" id="keyword" placeholder="Palavra-chave" required>
+                        </div>
+                        <button type="submit" class="btn-add">Adicionar</button>
+                    </form>
+                    <div class="list" id="keyword-list">
+                        <!-- Keywords aparecem aqui -->
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <!-- Fase 3: Configurações -->
+        <section class="card glass settings-section">
+            <h2>Configurações de Alerta (Discord)</h2>
+            <form id="settings-form">
+                <div class="input-wrapper">
+                    <input type="url" id="discord-webhook" placeholder="https://discord.com/api/webhooks/...">
+                </div>
+                <button type="submit" class="btn-primary">Salvar Webhook</button>
+            </form>
+        </section>
+
+        <!-- Histórico de Mensagens -->
+        <section class="card history glass">
+            <div class="history-header">
+                <div class="title-with-count">
+                    <h2>Mensagens Filtradas</h2>
+                    <span id="match-count" class="count-badge">0</span>
+                </div>
+                <div class="history-actions">
+                    <button id="btn-export" class="btn-refresh">Exportar CSV</button>
+                    <button id="btn-clear-all" class="btn-danger">🗑️ Limpar Tudo</button>
+                    <button id="btn-refresh" class="btn-refresh">🔄</button>
+                </div>
+            </div>
+
+            <!-- Linha de Filtros -->
+            <div class="filter-row glass-lite">
+                <div class="filter-group">
+                    <label>De:</label>
+                    <input type="date" id="filter-start-date">
+                </div>
+                <div class="filter-group">
+                    <label>Até:</label>
+                    <input type="date" id="filter-end-date">
+                </div>
+                <div class="filter-group">
+                    <label>Plataforma:</label>
+                    <select id="filter-platform">
+                        <option value="">Todas</option>
+                        <option value="Twitch">Twitch</option>
+                        <option value="YouTube">YouTube</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Streamer:</label>
+                    <select id="filter-streamer">
+                        <option value="">Todos</option>
+                    </select>
+                </div>
+                <button id="btn-apply-filters" class="btn-primary-small">Filtrar</button>
+                <button id="btn-reset-filters" class="btn-secondary-small">Limpar</button>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Streamer</th>
+                            <th>Plataforma</th>
+                            <th>Usuário</th>
+                            <th>Mensagem</th>
+                            <th>Timestamp</th>
+                            <th>Stream Time</th>
+                            <th>Ação</th>
+
+                        </tr>
+                    </thead>
+                    <tbody id="message-list">
+                        <!-- Mensagens aparecem aqui -->
+                    </tbody>
+                </table>
+            </div>
+            <div class="pagination" id="pagination">
+                <!-- Paginação aparece aqui -->
+            </div>
+        </section>
+    </div>
+
+    <!-- Feedback UI -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Som de Notificação -->
+    <audio id="notif-sound" preload="auto">
+        <source src="https://assets.mixkit.co/active_storage/sfx/2354/2354-preview.mp3" type="audio/mpeg">
+    </audio>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
