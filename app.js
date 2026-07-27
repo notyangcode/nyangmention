@@ -332,6 +332,12 @@ app.use((err, req, res, next) => {
     });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log(`Server running at http://localhost:${PORT}`);
+    console.log('Iniciando coleta automaticamente...');
+    try {
+        await monitor.start();
+    } catch (err) {
+        console.error('Erro ao auto-iniciar coleta:', err);
+    }
 });
