@@ -49,10 +49,6 @@ async function init() {
         updateStatusUI(active);
     });
 
-    socket.on('new_match', (data) => {
-        handleNewMatch(data);
-    });
-
     socket.on('update_match', (data) => {
         handleUpdateMatch(data);
     });
