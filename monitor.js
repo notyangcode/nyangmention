@@ -10,6 +10,25 @@ let kickClients = {};
 let isMonitoring = false;
 let io = null;
 let streamStartTimes = {}; // { platform_channelId: Date }
+const processedCache = new Map();
+
+function isDuplicateInMemory(streamerName, userName, message) {
+    const key = `${streamerName.toLowerCase()}:${userName.toLowerCase()}:${message.trim().toLowerCase()}`;
+    const now = Date.now();
+
+    for (const [k, time] of processedCache.entries()) {
+        if (now - time > 5000) {
+            processedCache.delete(k);
+        }
+    }
+
+    if (processedCache.has(key)) {
+        return true;
+    }
+
+    processedCache.set(key, now);
+    return false;
+}
 
 const monitor = {
     isMonitoring, // Expor para testes
@@ -114,9 +133,10 @@ const monitor = {
     },
 
     startTwitch(streamer) {
-        if (twitchClients[streamer.channel_id]) return;
+        const channelKey = streamer.channel_id.toLowerCase();
+        if (twitchClients[channelKey]) return;
 
-        const rawChannel = streamer.channel_id.toLowerCase();
+        const rawChannel = channelKey;
         const channel = rawChannel.startsWith('#') ? rawChannel : `#${rawChannel}`;
 
         console.log(`[Twitch] Tentando conectar ao canal: ${channel}`);
@@ -128,9 +148,6 @@ const monitor = {
         client.on('message', (ch, tags, message, self) => {
             if (self) return;
 
-            // Logar recebimento de qualquer mensagem para debug (pode ser removido depois)
-            // console.log(`[Twitch Debug] Mensagem em ${ch} de ${tags.username}: ${message}`);
-
             const displayUser = tags['display-name'] || tags.username || 'Sistema';
             const messageTs = tags['tmi-sent-ts'] ? new Date(parseInt(tags['tmi-sent-ts'])) : new Date();
             this.processMessage(streamer, displayUser, message, messageTs);
@@ -138,10 +155,9 @@ const monitor = {
 
         client.on('connected', async (address, port) => {
             console.log(`[Twitch] Conectado e monitorando: ${channel} (${address}:${port})`);
-            // Buscar uptime para definir streamStartTime
             const startTime = await this.getTwitchStartTime(streamer.channel_id);
             if (startTime) {
-                const key = `twitch_${streamer.channel_id.toLowerCase()}`;
+                const key = `twitch_${channelKey}`;
                 streamStartTimes[key] = startTime;
             }
         });
@@ -154,12 +170,11 @@ const monitor = {
             console.error(`[Twitch] Erro ao conectar em ${channel}:`, err.message);
         });
 
-        // Garantir que o status do monitor seja emitido quando o cliente Twitch conectar com sucesso
         client.on('connected', () => {
             if (io) io.emit('monitor_status', isMonitoring);
         });
 
-        twitchClients[streamer.channel_id] = client;
+        twitchClients[channelKey] = client;
     },
 
     async fetchLiveId(streamer) {
@@ -372,10 +387,13 @@ const monitor = {
 
     stopStreamer(channelId, platform) {
         if (platform.toLowerCase() === 'twitch') {
-            if (twitchClients[channelId]) {
-                twitchClients[channelId].disconnect();
+            const lower = channelId.toLowerCase();
+            const client = twitchClients[channelId] || twitchClients[lower];
+            if (client) {
+                try { client.disconnect(); } catch (err) {}
                 delete twitchClients[channelId];
-                delete streamStartTimes[`twitch_${channelId}`];
+                delete twitchClients[lower];
+                delete streamStartTimes[`twitch_${lower}`];
                 console.log(`[Twitch] Monitoramento parado para: ${channelId}`);
             }
         } else if (platform.toLowerCase() === 'youtube') {
@@ -567,10 +585,15 @@ const monitor = {
             const matchedKeyword = keywords.find(kw => lowerMessage.includes(kw.toLowerCase()));
 
             if (matchedKeyword) {
+                const safeUserName = userName || 'Desconhecido';
+                if (isDuplicateInMemory(streamer.name, safeUserName, message)) {
+                    console.log(`[InMemoryDuplicate Ignored] ${streamer.name}: [${safeUserName}] ${message}`);
+                    return;
+                }
+
                 console.log(`[Match Found] Streamer: ${streamer.name} | Keyword: ${matchedKeyword}`);
 
                 const timestamp = messageTs.toISOString ? messageTs.toISOString() : new Date(messageTs).toISOString();
-                const safeUserName = userName || 'Desconhecido';
 
                 // 2. Verificar se é uma duplicata recente (últimos 5 minutos)
                 const recentMessage = await db.findRecentMessage(streamer.name, message, 300);

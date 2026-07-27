@@ -115,8 +115,9 @@ const dbManager = {
     // Streamers
     addStreamer: (name, platform, channel_id) => {
         return new Promise((resolve, reject) => {
+            const cleanChannel = channel_id ? channel_id.trim().toLowerCase() : '';
             db.run('INSERT OR REPLACE INTO streamers (name, platform, channel_id, is_active) VALUES (?, ?, ?, 1)',
-                [name, platform, channel_id], function (err) {
+                [name, platform, cleanChannel], function (err) {
                     if (err) reject(err);
                     else resolve(this.lastID);
                 });

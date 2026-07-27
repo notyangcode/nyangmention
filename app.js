@@ -100,8 +100,9 @@ app.get('/api/streamers', async (req, res) => {
 app.post('/api/streamers', async (req, res) => {
     const { name, platform, channel_id } = req.body;
     try {
+        const normalizedChannel = channel_id ? channel_id.trim().toLowerCase() : '';
         console.log(`[API] Tentando adicionar streamer: ${name} (${platform})`);
-        await db.addStreamer(name, platform, channel_id);
+        await db.addStreamer(name, platform, normalizedChannel);
 
         // Iniciar monitoramento se o monitor global estiver ativo
         if (monitor.getStatus()) {
