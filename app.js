@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const { Parser } = require('json2csv');
 const db = require('./database');
 const monitor = require('./monitor');
+const retroactive = require('./retroactive');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,7 +18,7 @@ const io = new Server(server, {
     }
 });
 
-const PORT = 3005;
+const PORT = process.env.PORT || 3005;
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -248,6 +249,73 @@ app.post('/api/stop', (req, res) => {
         console.error('[API Error] POST /api/stop:', err);
         res.status(500).json({ error: err.message });
     }
+});
+
+// Retroactive Endpoints
+app.get('/api/retroactive/videos', async (req, res) => {
+    const { streamerId, date } = req.query;
+    try {
+        const streamers = await db.getStreamers();
+        const streamer = streamers.find(s => s.id == streamerId);
+        if (!streamer) return res.status(404).json({ error: 'Streamer não encontrado' });
+
+        const videos = await retroactive.findVideos(streamer, date);
+        res.json(videos);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/retroactive/scan', async (req, res) => {
+    const { vodUrl } = req.body;
+    if (!vodUrl) return res.status(400).json({ error: 'URL do VOD é obrigatória' });
+
+    try {
+        // Detectar plataforma e extrair videoId da URL
+        let videoId = null;
+        let platform = null;
+        let streamName = 'VOD';
+
+        if (vodUrl.includes('twitch.tv/videos/')) {
+            const m = vodUrl.match(/videos\/(\d+)/);
+            if (m) { videoId = m[1]; platform = 'twitch'; streamName = `Twitch VOD ${videoId}`; }
+        } else if (vodUrl.includes('youtube.com/watch')) {
+            const m = vodUrl.match(/v=([^&]+)/);
+            if (m) { videoId = m[1]; platform = 'youtube'; streamName = `YouTube VOD ${videoId}`; }
+        } else if (vodUrl.includes('youtu.be/')) {
+            const m = vodUrl.match(/youtu\.be\/([^?]+)/);
+            if (m) { videoId = m[1]; platform = 'youtube'; streamName = `YouTube VOD ${videoId}`; }
+        }
+
+        if (!videoId || !platform) {
+            return res.status(400).json({ error: 'URL não reconhecida. Use um link de VOD da Twitch ou YouTube.' });
+        }
+
+        // Construir objeto streamer genérico (não precisa existir no banco)
+        const streamer = {
+            id: null,
+            name: streamName,
+            platform: platform,
+            channel_id: videoId
+        };
+
+        const result = await retroactive.startScan(streamer, videoId, io);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/retroactive/status', (req, res) => {
+    res.json(retroactive.getStatus());
+});
+
+app.post('/api/retroactive/stop', (req, res) => {
+    const status = retroactive.getStatus();
+    status.active = false;
+    status.status = 'stopped';
+    io.emit('retroactive_status', status);
+    res.json({ success: true });
 });
 
 // Socket.io connection

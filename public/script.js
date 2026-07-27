@@ -57,9 +57,16 @@ async function init() {
         handleUpdateMatch(data);
     });
 
+    socket.on('retroactive_status', (data) => {
+        updateRetroactiveUI(data);
+    });
+
     socket.on('connect', () => {
         console.log('[Socket] Conectado ao servidor');
     });
+
+    setupTabNavigation();
+    initRetroactive();
 }
 
 // Settings
@@ -221,6 +228,16 @@ function formatOffset(seconds) {
     return [h, m, s].map(v => v.toString().padStart(2, '0')).join(':');
 }
 
+// Mapeia plataforma para emoji + label amigável
+function getPlatformLabel(platform) {
+    const map = {
+        'twitch':  '🟣 Twitch',
+        'youtube': '🔴 YouTube',
+        'kick':    '💚 Kick',
+    };
+    return map[platform.toLowerCase()] || platform;
+}
+
 function createMessageRow(m) {
     const tr = document.createElement('tr');
     tr.setAttribute('data-id', m.id);
@@ -234,7 +251,7 @@ function createMessageRow(m) {
             <strong>${m.streamer_name}</strong><br>
             <small style="color: var(--text-muted); font-size: 0.7rem;">${m.channel_id || ''}</small>
         </td>
-        <td><span class="platform-tag platform-${m.platform.toLowerCase()}">${m.platform}</span></td>
+        <td><span class="platform-tag platform-${m.platform.toLowerCase()}">${getPlatformLabel(m.platform)}</span></td>
         <td>${m.user_name}</td>
         <td>
             ${m.message}
@@ -296,6 +313,185 @@ async function loadStreamers() {
         console.error('Erro ao carregar streamers:', err);
     }
 }
+
+// Retroactive Analysis Logic
+function setupTabNavigation() {
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    const tabContents = document.querySelectorAll('.tab-content');
+
+    tabBtns.forEach(btn => {
+        btn.onclick = () => {
+            const tabId = btn.dataset.tab;
+            tabBtns.forEach(b => b.classList.remove('active'));
+            tabContents.forEach(c => c.classList.remove('active'));
+
+            btn.classList.add('active');
+            document.getElementById(`${tabId}-section`).classList.add('active');
+        };
+    });
+}
+
+const retroStreamerSelect = document.getElementById('retro-streamer-select');
+const retroDateInput = document.getElementById('retro-date-input');
+const btnFindVideos = document.getElementById('btn-find-videos');
+const retroVideoResults = document.getElementById('retro-video-results');
+const videoListContainer = document.getElementById('video-list');
+const retroActiveScan = document.getElementById('retro-active-scan');
+const scanProgress = document.getElementById('scan-progress');
+const scanProgressText = document.getElementById('scan-progress-text');
+const scanMatchesCount = document.getElementById('scan-matches-count');
+const scanStreamerName = document.getElementById('scan-streamer-name');
+const scanLog = document.getElementById('scan-log');
+
+const btnStartRetro = document.getElementById('btn-start-retro');
+const btnStopRetro = document.getElementById('btn-stop-retro');
+const retroStatusText = document.getElementById('retro-status-text');
+const retroStatusDot = document.getElementById('retro-status-dot');
+
+let selectedVodUrl = null;
+
+function initRetroactive() {
+    const btnAnalyzeLink = document.getElementById('btn-analyze-link');
+    const retroLinkInput = document.getElementById('retro-link-input');
+
+    // "Analisar" valida e habilita o botão de Iniciar
+    btnAnalyzeLink.onclick = () => {
+        const url = retroLinkInput.value.trim();
+
+        if (!url) {
+            return showToast('Cole um link válido!', 'warning');
+        }
+
+        const isTwitch = url.includes('twitch.tv/videos/');
+        const isYoutubeFull = url.includes('youtube.com/watch');
+        const isYoutubeShort = url.includes('youtu.be/');
+
+        if (isTwitch || isYoutubeFull || isYoutubeShort) {
+            selectedVodUrl = url;
+            btnStartRetro.disabled = false;
+            const platform = isTwitch ? '🟣 Twitch' : '🔴 YouTube';
+            retroStatusText.textContent = `${platform} VOD pronto para análise`;
+            showToast('Link válido! Clique em "Iniciar Análise".', 'success');
+        } else {
+            showToast('Link não reconhecido. Use um link de VOD da Twitch ou YouTube. (A Kick não suporta análise retroativa.)', 'danger');
+        }
+    };
+
+    const btnStopScan = document.getElementById('btn-stop-scan');
+
+    // Enter no campo também dispara a validação
+    document.getElementById('retro-link-input').onkeydown = (e) => {
+        if (e.key === 'Enter') btnAnalyzeLink.click();
+    };
+
+    btnStartRetro.onclick = () => {
+        if (selectedVodUrl) startRetroScan(selectedVodUrl);
+    };
+
+    const stopScan = async () => {
+        await fetch(`${API_URL}/retroactive/stop`, { method: 'POST' });
+    };
+
+    btnStopRetro.onclick = stopScan;
+    if (btnStopScan) btnStopScan.onclick = stopScan;
+
+    // Carregar status ao abrir
+    fetch(`${API_URL}/retroactive/status`)
+        .then(res => res.json())
+        .then(data => updateRetroactiveUI(data));
+}
+
+function selectVideo(element, streamerId, videoId) {
+    document.querySelectorAll('.video-item').forEach(el => el.classList.remove('selected'));
+    element.classList.add('selected');
+    selectedVideoId = videoId;
+    selectedStreamerId = streamerId;
+    btnStartRetro.disabled = false;
+    showToast('Vídeo selecionado! Agora clique em Iniciar Análise.', 'info');
+}
+
+async function fetchStreamersForRetro() {
+    try {
+        const res = await fetch(`${API_URL}/streamers`);
+        const data = await res.json();
+        retroStreamerSelect.innerHTML = '<option value="">Selecione um streamer</option>' +
+            data.map(s => `<option value="${s.id}">${s.name} (${s.platform})</option>`).join('');
+    } catch (err) { }
+}
+
+window.startRetroScan = async (vodUrl) => {
+    try {
+        const res = await fetch(`${API_URL}/retroactive/scan`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ vodUrl })
+        });
+        const data = await res.json();
+        if (data.error) {
+            showToast(data.error, 'warning');
+        } else {
+            showToast('Escaneamento iniciado!', 'success');
+        }
+    } catch (err) {
+        showToast('Erro ao iniciar escaneamento', 'danger');
+    }
+};
+
+function updateRetroactiveUI(data) {
+    if (data.active) {
+        retroActiveScan.style.display = 'block';
+        scanStreamerName.textContent = data.streamer;
+        scanProgress.style.width = `${data.progress}%`;
+        scanProgressText.textContent = `${Math.round(data.progress)}%`;
+        scanMatchesCount.textContent = data.foundCount;
+        
+        retroStatusText.textContent = `Status: Analisando ${data.streamer}...`;
+        retroStatusDot.classList.add('active');
+        btnStartRetro.disabled = true;
+        btnStopRetro.disabled = false;
+    } else {
+        retroStatusDot.classList.remove('active');
+        btnStopRetro.disabled = true;
+        
+        if (data.status === 'completed') {
+            retroStatusText.textContent = 'Análise concluída!';
+            showToast(`Análise de ${data.streamer} concluída! ${data.foundCount} matches encontrados.`, 'success');
+            retroActiveScan.style.display = 'block';
+            btnStartRetro.disabled = true;
+        } else if (data.status === 'error_live_active') {
+            retroStatusText.textContent = '⚠️ Live ainda está ao vivo';
+            showToast('Este vídeo ainda está AO VIVO. A análise retroativa só funciona com lives que já encerraram.', 'warning');
+            retroActiveScan.style.display = 'none';
+            btnStartRetro.disabled = !selectedVideoId;
+        } else if (data.status === 'stopped') {
+            retroStatusText.textContent = 'Análise interrompida.';
+            retroActiveScan.style.display = 'block';
+            btnStartRetro.disabled = false;
+        } else {
+            retroStatusText.textContent = 'Pronto para analisar';
+            retroActiveScan.style.display = 'none';
+            btnStartRetro.disabled = !selectedVideoId;
+        }
+    }
+}
+
+// Inserir log no scan
+socket.on('new_match', (data) => {
+    if (data.retroactive) {
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.innerHTML = `
+            <span class="log-time">[${new Date(data.timestamp).toLocaleTimeString()}]</span>
+            <span class="log-user">${data.user_name}:</span>
+            ${data.message.substring(0, 50)}${data.message.length > 50 ? '...' : ''}
+            (<span class="log-kw">${data.keyword}</span>)
+        `;
+        scanLog.appendChild(entry);
+        scanLog.scrollTop = scanLog.scrollHeight;
+    } else {
+        handleNewMatch(data);
+    }
+});
 
 window.deleteStreamer = async (id) => {
     try {

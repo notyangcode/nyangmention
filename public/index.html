@@ -26,8 +26,9 @@
             <p>Monitoramento ultra-rápido via WebSockets</p>
         </header>
 
-        <nav class="tabs" style="display: none;">
+        <nav class="tabs">
             <button class="tab-btn active" data-tab="live">Monitoramento Live</button>
+            <button class="tab-btn" data-tab="retroactive">Análise Retroativa</button>
         </nav>
 
         <div id="live-section" class="tab-content active">
@@ -59,6 +60,7 @@
                             <select id="platform" required>
                                 <option value="Twitch">Twitch</option>
                                 <option value="YouTube">YouTube</option>
+                                <option value="Kick">Kick</option>
                             </select>
                             <input type="text" id="channel-id" placeholder="ID do Canal / User" required>
                         </div>
@@ -83,6 +85,63 @@
                     </div>
                 </section>
             </div>
+        </div>
+
+        <div id="retroactive-section" class="tab-content">
+            <section class="card glass">
+                <div class="retro-header">
+                    <h2>Análise Retroativa de VOD</h2>
+                    <p class="subtitle">Cole o link de uma <strong>live já encerrada</strong> da Twitch ou YouTube para escanear o chat em busca das palavras-chave cadastradas.</p>
+                </div>
+
+                <div class="input-group-vertical" style="margin-top: 20px;">
+                    <label>Link do VOD</label>
+                    <div class="input-group">
+                        <input type="text" id="retro-link-input"
+                            placeholder="https://www.twitch.tv/videos/123... ou https://youtu.be/..."
+                            style="flex: 1">
+                        <button id="btn-analyze-link" class="btn-primary">Analisar</button>
+                    </div>
+                    <small class="subtitle" style="margin-top: 6px;">⚠️ Apenas lives já encerradas. Links de lives ao vivo não são suportados.</small>
+                </div>
+            </section>
+
+            <!-- Card de Controle da Análise -->
+            <section class="status-card glass" id="retro-control-card" style="margin-top: 30px;">
+                <div class="status-info">
+                    <div class="status-pulse">
+                        <span class="status-dot" id="retro-status-dot"></span>
+                    </div>
+                    <span id="retro-status-text">Pronto para analisar</span>
+                </div>
+                <div class="controls">
+                    <button id="btn-start-retro" class="btn-primary" disabled>Iniciar Análise</button>
+                    <button id="btn-stop-retro" class="btn-secondary" disabled>Parar Análise</button>
+                </div>
+            </section>
+
+            <section id="retro-active-scan" class="card glass" style="display: none;">
+                    <div class="scan-header">
+                        <div class="scan-title">
+                            <span class="pulse-icon"></span>
+                            <h3>Escaneando: <span id="scan-streamer-name">-</span></h3>
+                        </div>
+                        <button id="btn-stop-scan" class="btn-danger-small">Parar</button>
+                    </div>
+                    
+                    <div class="progress-container">
+                        <div class="progress-bar" id="scan-progress" style="width: 0%"></div>
+                    </div>
+                    
+                    <div class="scan-stats">
+                        <span>Progresso: <span id="scan-progress-text">0%</span></span>
+                        <span>Matches: <span id="scan-matches-count">0</span></span>
+                    </div>
+
+                    <div id="scan-log" class="scan-log">
+                        <!-- Log de matches recentes -->
+                    </div>
+                </section>
         </div>
 
         <!-- Fase 3: Configurações -->
@@ -126,6 +185,7 @@
                         <option value="">Todas</option>
                         <option value="Twitch">Twitch</option>
                         <option value="YouTube">YouTube</option>
+                        <option value="Kick">Kick</option>
                     </select>
                 </div>
                 <div class="filter-group">
