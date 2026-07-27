@@ -332,10 +332,49 @@ app.use((err, req, res, next) => {
     });
 });
 
+async function sendSystemNotification(message, color = 16711680) {
+    try {
+        const webhookUrl = await db.getSetting('discord_webhook');
+        if (!webhookUrl) return;
+        const axios = require('axios');
+        const embed = {
+            title: "🤖 Sistema Nyang Mentions",
+            description: message,
+            color: color,
+            timestamp: new Date()
+        };
+        await axios.post(webhookUrl, { embeds: [embed] }).catch(() => {});
+    } catch (err) {
+        console.error('[Discord] Falha ao enviar notificação de sistema:', err.message);
+    }
+}
+
+// Graceful shutdown handling
+const handleShutdown = async (reason) => {
+    console.log(`[Shutdown] Recebido: ${reason}`);
+    await sendSystemNotification(`🔴 **Servidor Parado ou Caiu**\nMotivo: ${reason}`, 16711680);
+    process.exit(1);
+};
+
+process.on('SIGINT', () => handleShutdown('SIGINT (Interrompido pelo usuário/PM2)'));
+process.on('SIGTERM', () => handleShutdown('SIGTERM (Finalizado pelo sistema)'));
+process.on('uncaughtException', async (err) => {
+    console.error('Uncaught Exception:', err);
+    await sendSystemNotification(`🔴 **Crash Inesperado**\nErro: \`${err.message}\``, 16711680);
+    process.exit(1);
+});
+process.on('unhandledRejection', async (reason) => {
+    console.error('Unhandled Rejection:', reason);
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    await sendSystemNotification(`🔴 **Erro Assíncrono Inesperado**\nDetalhe: \`${msg}\``, 16711680);
+    process.exit(1);
+});
+
 server.listen(PORT, async () => {
     console.log(`Server running at http://localhost:${PORT}`);
     console.log('Iniciando coleta automaticamente...');
     try {
+        await sendSystemNotification("🟢 **Servidor Iniciado**\nA aplicação foi ligada e o monitoramento está sendo retomado automaticamente.", 3066993);
         await monitor.start();
     } catch (err) {
         console.error('Erro ao auto-iniciar coleta:', err);
