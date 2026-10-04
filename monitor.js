@@ -87,11 +87,9 @@ const monitor = {
         youtubeClients = {};
 
         // Stop Kick clients
-        for (const channelId in kickClients) {
-            const kc = kickClients[channelId];
-            if (kc && kc.ws) {
-                try { kc.ws.close(); } catch (e) {}
-            }
+        const kickKeys = Object.keys(kickClients);
+        for (const channelId of kickKeys) {
+            this.stopKick(channelId);
         }
         kickClients = {};
         streamStartTimes = {};
@@ -113,8 +111,11 @@ const monitor = {
                 }
 
                 // Kick retry logic
-                if (platform === 'kick' && !kickClients[streamer.channel_id]) {
-                    this.startKick(streamer);
+                if (platform === 'kick') {
+                    const kc = kickClients[streamer.channel_id] || kickClients[streamer.channel_id.toLowerCase()];
+                    if (!kc || !kc.active || !kc.ws || kc.ws.readyState !== WebSocket.OPEN) {
+                        this.startKick(streamer);
+                    }
                 }
 
                 // Generic start time retry logic
@@ -123,7 +124,15 @@ const monitor = {
                         const startTime = await this.getTwitchStartTime(streamer.channel_id);
                         if (startTime) streamStartTimes[key] = startTime;
                     } else if (platform === 'youtube' && youtubeClients[streamer.channel_id]) {
-                        // Attempt to get from active YT client if possible (already handled in YT's 'start' event, but here for safety)
+                        // Attempt to get from active YT client if possible
+                    } else if (platform === 'kick') {
+                        const { username } = this.cleanKickUsername(streamer.channel_id);
+                        const info = await this.getKickChannelInfo(username);
+                        if (info && info.livestreamCreatedAt) {
+                            const st = new Date(info.livestreamCreatedAt);
+                            streamStartTimes[key] = st;
+                            streamStartTimes[`kick_${username}`] = st;
+                        }
                     }
                 }
             }
@@ -407,9 +416,29 @@ const monitor = {
     // KICK — Conexão direta via Pusher WebSocket (sem Playwright)
     // Fluxo: axios busca chatroom ID na API pública da Kick → WebSocket ao Pusher
     // ─────────────────────────────────────────────────────────────────────────
+    cleanKickUsername(input) {
+        if (!input) return { username: '', customChatroomId: null };
+        let cleaned = input.trim();
+        
+        // Remove URLs como https://kick.com/username
+        cleaned = cleaned.replace(/^https?:\/\/(www\.)?kick\.com\//i, '');
+        // Remove query parameters ou trailing slashes
+        cleaned = cleaned.split('?')[0].split('#')[0].replace(/\/+$/, '');
+        // Remove @ inicial
+        cleaned = cleaned.replace(/^@/, '');
+
+        // Suportar formato username:chatroomId
+        const parts = cleaned.split(':');
+        const username = parts[0].toLowerCase().trim();
+        const customChatroomId = parts[1] ? parseInt(parts[1].trim()) : null;
+
+        return { username, customChatroomId };
+    },
+
     async getKickChannelInfo(username) {
         try {
-            const response = await axios.get(`https://kick.com/api/v2/channels/${username}`, {
+            const cleanUser = encodeURIComponent(username.toLowerCase());
+            const response = await axios.get(`https://kick.com/api/v2/channels/${cleanUser}`, {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                     'Accept': 'application/json, text/plain, */*',
@@ -422,11 +451,12 @@ const monitor = {
             return {
                 chatroomId: data.chatroom && data.chatroom.id,
                 channelId: data.id,
-                livestreamCreatedAt: (data.livestream && data.livestream.created_at) || null
+                livestreamCreatedAt: (data.livestream && data.livestream.created_at) || null,
+                isLive: !!data.livestream
             };
         } catch (err) {
             if (err.response && err.response.status === 403) {
-                console.warn(`[Kick] API bloqueada (403) para ${username}. Verifique se o canal existe ou tente mais tarde.`);
+                console.warn(`[Kick] API bloqueada (403) para ${username}. Verifique se o canal existe ou use username:chatroomId.`);
             } else if (err.response && err.response.status === 404) {
                 console.error(`[Kick] Canal não encontrado na Kick: ${username}`);
             } else {
@@ -437,59 +467,71 @@ const monitor = {
     },
 
     async startKick(streamer) {
-        if (kickClients[streamer.channel_id]) return;
+        const channelKey = streamer.channel_id.toLowerCase();
+        if (kickClients[channelKey] && kickClients[channelKey].active && kickClients[channelKey].ws && kickClients[channelKey].ws.readyState === WebSocket.OPEN) {
+            return;
+        }
 
-        // Suportar formato username:chatroomId ou simplesmente username
-        const parts = streamer.channel_id.split(':');
-        const username = parts[0].toLowerCase();
-        const customChatroomId = parts[1] ? parseInt(parts[1]) : null;
+        const { username, customChatroomId } = this.cleanKickUsername(streamer.channel_id);
+        if (!username) {
+            console.error(`[Kick] Nome de usuário inválido: ${streamer.channel_id}`);
+            return;
+        }
 
         console.log(`[Kick] Tentando conectar ao canal: ${username}${customChatroomId ? ` (Chatroom ID manual: ${customChatroomId})` : ''}`);
 
-        // Reservar slot imediatamente para evitar conexões duplicadas
-        kickClients[streamer.channel_id] = { active: true, ws: null };
+        // Limpar qualquer cliente existente anterior
+        if (kickClients[channelKey]) {
+            this.stopKick(streamer.channel_id);
+        }
+
+        const clientState = {
+            active: true,
+            ws: null,
+            pingInterval: null,
+            reconnectTimeout: null
+        };
+        kickClients[channelKey] = clientState;
+        kickClients[streamer.channel_id] = clientState;
 
         const doConnect = async () => {
-            try {
-                let info = null;
-                let chatroomId = customChatroomId;
-                let channelId = null;
-                let livestreamCreatedAt = null;
+            if (!isMonitoring || !clientState.active) return;
 
-                // Se não foi fornecido chatroomId manual, tentamos buscar via API
-                if (!chatroomId) {
-                    info = await this.getKickChannelInfo(username);
-                    if (info) {
-                        chatroomId = info.chatroomId;
-                        channelId = info.channelId;
-                        livestreamCreatedAt = info.livestreamCreatedAt;
-                    }
-                }
+            try {
+                let info = await this.getKickChannelInfo(username);
+                let chatroomId = (info && info.chatroomId) || customChatroomId;
+                let channelId = info && info.channelId;
+                let livestreamCreatedAt = info && info.livestreamCreatedAt;
 
                 if (!chatroomId) {
                     console.error(`[Kick] Não foi possível obter o Chatroom ID para: ${username}.`);
-                    console.error(`[Kick] IMPORTANTE: Como a Kick bloqueia consultas diretas via Cloudflare (403), adicione o streamer no formato 'username:chatroomId' (exemplo: 'sacy:283627' ou 'tck10:5728410') para burlar o bloqueio.`);
-                    delete kickClients[streamer.channel_id];
+                    console.error(`[Kick] Dica: Você pode cadastrar como '${username}:<chatroomId>' para conexão direta.`);
+                    
+                    // Se ainda estiver monitorando, tentar reconectar após 30 segundos
+                    if (isMonitoring && clientState.active) {
+                        clientState.reconnectTimeout = setTimeout(() => doConnect(), 30000);
+                    }
                     return;
                 }
 
-                // Verificar se ainda devemos conectar (pode ter sido parado durante a busca)
-                if (!kickClients[streamer.channel_id]) return;
+                if (!isMonitoring || !clientState.active) return;
 
-                // 2. Definir horário de início da live para cálculo de offset
-                const key = `kick_${username}`;
+                // Definir horários para cálculo de offset (salva nas duas chaves possíveis)
+                const startTimestamp = livestreamCreatedAt ? new Date(livestreamCreatedAt) : new Date();
+                streamStartTimes[`kick_${username}`] = startTimestamp;
+                streamStartTimes[`kick_${channelKey}`] = startTimestamp;
+                streamStartTimes[`kick_${streamer.channel_id}`] = startTimestamp;
+
                 if (livestreamCreatedAt) {
-                    streamStartTimes[key] = new Date(livestreamCreatedAt);
-                    console.log(`[Kick] Horário de início da live obtido para: ${username}`);
+                    console.log(`[Kick] Horário de início da live obtido para ${username}: ${startTimestamp.toISOString()}`);
                 } else {
-                    streamStartTimes[key] = new Date();
                     console.log(`[Kick] Offset iniciado no momento da conexão para: ${username}`);
                 }
 
-                // 3. Conectar ao Pusher WebSocket da Kick
+                // Conectar ao Pusher WebSocket da Kick
                 const PUSHER_URL = 'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0-rc2&flash=false';
                 const ws = new WebSocket(PUSHER_URL);
-                kickClients[streamer.channel_id].ws = ws;
+                clientState.ws = ws;
 
                 ws.on('open', () => {
                     console.log(`[Kick] WebSocket conectado: ${username} (sala ${chatroomId})`);
@@ -501,7 +543,19 @@ const monitor = {
                     if (channelId) {
                         subscriptions.push({ event: 'pusher:subscribe', data: { channel: `channel.${channelId}` } });
                     }
-                    subscriptions.forEach(sub => ws.send(JSON.stringify(sub)));
+                    subscriptions.forEach(sub => {
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify(sub));
+                        }
+                    });
+
+                    // Heartbeat ping a cada 30 segundos
+                    if (clientState.pingInterval) clearInterval(clientState.pingInterval);
+                    clientState.pingInterval = setInterval(() => {
+                        if (ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ event: 'pusher:ping', data: {} }));
+                        }
+                    }, 30000);
 
                     if (io) io.emit('monitor_status', isMonitoring);
                 });
@@ -512,48 +566,54 @@ const monitor = {
                         const { event, data: evtData } = parsed;
                         if (!event) return;
 
-                        // Responder ao ping do Pusher para manter a conexão viva
+                        // Responder ao ping do Pusher
                         if (event === 'pusher:ping') {
-                            ws.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
+                            if (ws.readyState === WebSocket.OPEN) {
+                                ws.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
+                            }
                             return;
                         }
 
-                        // Evento: "App\Events\ChatMessageEvent" → split por \ → pega último segmento
-                        const parts = event.split('\\');
-                        const eventType = parts[parts.length - 1];
-
-                        if (eventType === 'ChatMessageEvent') {
+                        // Parse de mensagem de chat Kick
+                        if (event.includes('ChatMessageEvent')) {
                             const msg = typeof evtData === 'string' ? JSON.parse(evtData) : evtData;
                             if (!msg || !msg.content) return;
-                            const author = (msg.sender && msg.sender.username) ? msg.sender.username : 'Usuário Kick';
+                            const author = (msg.sender && (msg.sender.username || msg.sender.slug)) || 'Usuário Kick';
                             const messageTs = msg.created_at ? new Date(msg.created_at) : new Date();
                             this.processMessage(streamer, author, msg.content, messageTs);
 
-                        } else if (eventType === 'StopStreamBroadcast') {
-                            console.log(`[Kick] Stream encerrada: ${username}`);
-                            this.stopKick(streamer.channel_id);
+                        } else if (event.includes('StopStreamBroadcast')) {
+                            console.log(`[Kick] Notificação de encerramento de transmissão para: ${username}`);
                         }
                     } catch (parseErr) {
-                        // Ignorar erros de parse de mensagens individuais
+                        // Ignorar erros de parse individuais
                     }
                 });
 
                 ws.on('error', (err) => {
                     console.error(`[Kick WebSocket Error] ${username}:`, err.message);
+                    try { ws.close(); } catch (e) {}
                 });
 
-                ws.on('close', () => {
-                    console.log(`[Kick] WebSocket fechado: ${username}`);
-                    if (kickClients[streamer.channel_id]) {
-                        delete kickClients[streamer.channel_id];
-                        delete streamStartTimes[`kick_${username}`];
+                ws.on('close', (code, reason) => {
+                    console.log(`[Kick] WebSocket fechado: ${username} (code: ${code})`);
+                    if (clientState.pingInterval) {
+                        clearInterval(clientState.pingInterval);
+                        clientState.pingInterval = null;
+                    }
+
+                    // Auto-reconectar se o monitoramento ainda estiver ativo
+                    if (isMonitoring && clientState.active) {
+                        console.log(`[Kick] Agendando reconexão para ${username} em 5s...`);
+                        clientState.reconnectTimeout = setTimeout(() => doConnect(), 5000);
                     }
                 });
 
             } catch (err) {
-                console.error(`[Kick] Falha ao iniciar para ${streamer.name}:`, err.message);
-                delete kickClients[streamer.channel_id];
-                delete streamStartTimes[`kick_${username}`];
+                console.error(`[Kick] Falha na inicialização para ${streamer.name}:`, err.message);
+                if (isMonitoring && clientState.active) {
+                    clientState.reconnectTimeout = setTimeout(() => doConnect(), 10000);
+                }
             }
         };
 
@@ -562,17 +622,26 @@ const monitor = {
 
     stopKick(channelId) {
         const lower = channelId.toLowerCase();
-        // Suporta tanto a chave original quanto a minuscula
         const kc = kickClients[channelId] || kickClients[lower];
         if (kc) {
             kc.active = false;
+            if (kc.reconnectTimeout) {
+                clearTimeout(kc.reconnectTimeout);
+                kc.reconnectTimeout = null;
+            }
+            if (kc.pingInterval) {
+                clearInterval(kc.pingInterval);
+                kc.pingInterval = null;
+            }
             if (kc.ws) {
                 try { kc.ws.close(); } catch (e) {}
+                kc.ws = null;
             }
         }
         delete kickClients[channelId];
         delete kickClients[lower];
         delete streamStartTimes[`kick_${lower}`];
+        delete streamStartTimes[`kick_${channelId}`];
         console.log(`[Kick] Monitoramento parado para: ${channelId}`);
     },
 
