@@ -100,7 +100,24 @@ app.get('/api/streamers', async (req, res) => {
 app.post('/api/streamers', async (req, res) => {
     const { name, platform, channel_id } = req.body;
     try {
-        const normalizedChannel = channel_id ? channel_id.trim().toLowerCase() : '';
+        let normalizedChannel = channel_id ? channel_id.trim().toLowerCase() : '';
+
+        // Kick: descobrir o chatroomId automaticamente a partir do nome do canal (ou link)
+        if (platform && platform.toLowerCase() === 'kick') {
+            const { username, customChatroomId } = monitor.cleanKickUsername(normalizedChannel);
+            if (!username) return res.status(400).json({ error: 'Informe o nome do canal da Kick.' });
+            if (customChatroomId) {
+                normalizedChannel = `${username}:${customChatroomId}`;
+            } else {
+                const info = await monitor.getKickChannelInfo(username);
+                if (!info || !info.chatroomId) {
+                    return res.status(400).json({ error: `Canal "${username}" não encontrado na Kick. Confira o nome (ou informe usuario:chatroomId).` });
+                }
+                normalizedChannel = `${username}:${info.chatroomId}`;
+                console.log(`[API] Kick: chatroomId de ${username} descoberto automaticamente: ${info.chatroomId}`);
+            }
+        }
+
         console.log(`[API] Tentando adicionar streamer: ${name} (${platform})`);
         await db.addStreamer(name, platform, normalizedChannel);
 
@@ -379,4 +396,7 @@ server.listen(PORT, async () => {
     } catch (err) {
         console.error('Erro ao auto-iniciar coleta:', err);
     }
+
+    // Verificação periódica da conexão com as plataformas (avisa no Discord se caírem)
+    require('./platformHealth').start(sendSystemNotification);
 });
