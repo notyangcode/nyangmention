@@ -9,6 +9,13 @@ let youtubeClients = {};
 let kickClients = {};
 let isMonitoring = false;
 let io = null;
+const KICK_REALTIME_FALLBACK_URL = 'wss://realtime.us-east-1.platform.kick.com/connection/websocket';
+const KICK_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Origin': 'https://kick.com',
+    'Referer': 'https://kick.com/',
+    'Accept': 'application/json, text/plain, */*'
+};
 let streamStartTimes = {}; // { platform_channelId: Date }
 const processedCache = new Map();
 
@@ -413,8 +420,8 @@ const monitor = {
     },
 
     // ─────────────────────────────────────────────────────────────────────────
-    // KICK — Conexão direta via Pusher WebSocket (sem Playwright)
-    // Fluxo: axios busca chatroom ID na API pública da Kick → WebSocket ao Pusher
+    // KICK — Conexão direta via Centrifugo WebSocket (sem Playwright)
+    // Fluxo: axios busca chatroom ID na API pública da Kick → token guest + WebSocket ao Centrifugo
     // ─────────────────────────────────────────────────────────────────────────
     cleanKickUsername(input) {
         if (!input) return { username: '', customChatroomId: null };
@@ -464,6 +471,35 @@ const monitor = {
             }
             return null;
         }
+    },
+
+    // Retorna a URL do WebSocket realtime (Centrifugo). Usa fallback conhecido se a API falhar.
+    async getKickRealtimeUrl(chatroomId) {
+        try {
+            const res = await axios.post(
+                `https://web.kick.com/api/v1/realtime/channels/${chatroomId}/chat/connection`,
+                { client: { id: 'guest' + Math.random().toString(36).slice(2, 12), type: 'web' }, capabilities: { accepted_providers: [{ provider: 'centrifugo' }] } },
+                { headers: KICK_HEADERS, timeout: 10000 }
+            );
+            const conns = (res.data && res.data.data && res.data.data.connections) || [];
+            const c = conns.find(x => x.provider === 'centrifugo' && x.credentials && x.credentials.url);
+            if (c) return c.credentials.url;
+        } catch (err) {
+            console.warn('[Kick] Não foi possível obter URL realtime, usando fallback:', err.message);
+        }
+        return KICK_REALTIME_FALLBACK_URL;
+    },
+
+    // Token anônimo (guest) necessário para conectar ao Centrifugo
+    async getKickConnectionToken(clientId) {
+        const res = await axios.post(
+            'https://web.kick.com/api/v1/realtime/auth/connection',
+            { client_id: clientId },
+            { headers: KICK_HEADERS, timeout: 10000 }
+        );
+        const token = res.data && res.data.data && res.data.data.token;
+        if (!token) throw new Error('resposta sem token');
+        return token;
     },
 
     async startKick(streamer) {
@@ -528,65 +564,96 @@ const monitor = {
                     console.log(`[Kick] Offset iniciado no momento da conexão para: ${username}`);
                 }
 
-                // Conectar ao Pusher WebSocket da Kick
-                const PUSHER_URL = 'wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=8.4.0-rc2&flash=false';
-                const ws = new WebSocket(PUSHER_URL);
+                // Conectar ao Centrifugo da Kick (a Kick migrou do Pusher para o Centrifugo)
+                const realtimeUrl = await this.getKickRealtimeUrl(chatroomId);
+                const ws = new WebSocket(realtimeUrl, { headers: KICK_HEADERS });
                 clientState.ws = ws;
+                let lastFrameAt = Date.now();
+                let cmdId = 1;
+                const clientGuestId = 'guest' + Math.random().toString(36).slice(2, 12);
+                const sendJson = (obj) => { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
 
-                ws.on('open', () => {
-                    console.log(`[Kick] WebSocket conectado: ${username} (sala ${chatroomId})`);
+                const cleanup = () => {
+                    if (clientState.pingInterval) { clearInterval(clientState.pingInterval); clientState.pingInterval = null; }
+                    if (clientState.refreshTimeout) { clearTimeout(clientState.refreshTimeout); clientState.refreshTimeout = null; }
+                };
 
-                    // Inscrever nos canais do Pusher
-                    const subscriptions = [
-                        { event: 'pusher:subscribe', data: { channel: `chatrooms.${chatroomId}.v2` } }
-                    ];
-                    if (channelId) {
-                        subscriptions.push({ event: 'pusher:subscribe', data: { channel: `channel.${channelId}` } });
+                ws.on('open', async () => {
+                    try {
+                        const token = await this.getKickConnectionToken(clientGuestId);
+                        sendJson({ id: cmdId++, connect: { token, name: 'js' } });
+                    } catch (e) {
+                        console.error(`[Kick] Falha ao obter token de conexão para ${username}:`, e.message);
+                        try { ws.close(); } catch (_) {}
                     }
-                    subscriptions.forEach(sub => {
-                        if (ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify(sub));
-                        }
-                    });
-
-                    // Heartbeat ping a cada 30 segundos
-                    if (clientState.pingInterval) clearInterval(clientState.pingInterval);
-                    clientState.pingInterval = setInterval(() => {
-                        if (ws.readyState === WebSocket.OPEN) {
-                            ws.send(JSON.stringify({ event: 'pusher:ping', data: {} }));
-                        }
-                    }, 30000);
-
-                    if (io) io.emit('monitor_status', isMonitoring);
                 });
 
+                // Watchdog: o servidor envia ping a cada ~25s. Sem nenhum frame por 90s => conexão morta.
+                clientState.pingInterval = setInterval(() => {
+                    if (Date.now() - lastFrameAt > 90000) {
+                        console.warn(`[Kick] Sem dados há 90s para ${username}, reiniciando conexão...`);
+                        try { ws.terminate(); } catch (_) {}
+                    }
+                }, 15000);
+
+                const handlePublication = (pubData) => {
+                    if (!pubData || !pubData.event) return;
+                    if (pubData.event.includes('ChatMessageEvent')) {
+                        const msg = typeof pubData.data === 'string' ? JSON.parse(pubData.data) : pubData.data;
+                        if (!msg || !msg.content) return;
+                        const author = (msg.sender && (msg.sender.username || msg.sender.slug)) || 'Usuário Kick';
+                        const messageTs = msg.created_at ? new Date(msg.created_at) : new Date();
+                        this.processMessage(streamer, author, msg.content, messageTs);
+                    }
+                };
+
+                // Renova o token de conexão antes de expirar (ttl em segundos)
+                const scheduleRefresh = (ttl) => {
+                    clientState.refreshTimeout = setTimeout(async () => {
+                        try {
+                            const token = await this.getKickConnectionToken(clientGuestId);
+                            sendJson({ id: cmdId++, refresh: { token } });
+                            scheduleRefresh(ttl);
+                        } catch (e) {
+                            console.error(`[Kick] Falha ao renovar token (${username}):`, e.message);
+                            try { ws.close(); } catch (_) {}
+                        }
+                    }, ttl * 800);
+                };
+
                 ws.on('message', (raw) => {
-                    try {
-                        const parsed = JSON.parse(raw.toString());
-                        const { event, data: evtData } = parsed;
-                        if (!event) return;
+                    lastFrameAt = Date.now();
+                    // Centrifugo pode enviar vários frames JSON separados por \n
+                    for (const line of raw.toString().split('\n')) {
+                        if (!line.trim()) continue;
+                        try {
+                            const frame = JSON.parse(line);
 
-                        // Responder ao ping do Pusher
-                        if (event === 'pusher:ping') {
-                            if (ws.readyState === WebSocket.OPEN) {
-                                ws.send(JSON.stringify({ event: 'pusher:pong', data: {} }));
+                            // Ping do servidor ({}): responder com {} (pong)
+                            if (Object.keys(frame).length === 0) {
+                                if (ws.readyState === WebSocket.OPEN) ws.send('{}');
+                                continue;
                             }
-                            return;
-                        }
 
-                        // Parse de mensagem de chat Kick
-                        if (event.includes('ChatMessageEvent')) {
-                            const msg = typeof evtData === 'string' ? JSON.parse(evtData) : evtData;
-                            if (!msg || !msg.content) return;
-                            const author = (msg.sender && (msg.sender.username || msg.sender.slug)) || 'Usuário Kick';
-                            const messageTs = msg.created_at ? new Date(msg.created_at) : new Date();
-                            this.processMessage(streamer, author, msg.content, messageTs);
+                            if (frame.error) {
+                                console.error(`[Kick] Erro do servidor realtime (${username}): ${frame.error.code} ${frame.error.message}`);
+                                continue;
+                            }
 
-                        } else if (event.includes('StopStreamBroadcast')) {
-                            console.log(`[Kick] Notificação de encerramento de transmissão para: ${username}`);
+                            if (frame.connect) {
+                                console.log(`[Kick] WebSocket conectado: ${username} (sala ${chatroomId})`);
+                                sendJson({ id: cmdId++, subscribe: { channel: `chatrooms.${chatroomId}.v2` } });
+                                if (frame.connect.expires) scheduleRefresh(frame.connect.ttl || 2700);
+                                if (io) io.emit('monitor_status', isMonitoring);
+                                continue;
+                            }
+
+                            if (frame.push && frame.push.pub) {
+                                handlePublication(frame.push.pub.data);
+                            }
+                        } catch (parseErr) {
+                            // Ignorar erros de parse individuais
                         }
-                    } catch (parseErr) {
-                        // Ignorar erros de parse individuais
                     }
                 });
 
@@ -597,10 +664,7 @@ const monitor = {
 
                 ws.on('close', (code, reason) => {
                     console.log(`[Kick] WebSocket fechado: ${username} (code: ${code})`);
-                    if (clientState.pingInterval) {
-                        clearInterval(clientState.pingInterval);
-                        clientState.pingInterval = null;
-                    }
+                    cleanup();
 
                     // Auto-reconectar se o monitoramento ainda estiver ativo
                     if (isMonitoring && clientState.active) {
@@ -632,6 +696,10 @@ const monitor = {
             if (kc.pingInterval) {
                 clearInterval(kc.pingInterval);
                 kc.pingInterval = null;
+            }
+            if (kc.refreshTimeout) {
+                clearTimeout(kc.refreshTimeout);
+                kc.refreshTimeout = null;
             }
             if (kc.ws) {
                 try { kc.ws.close(); } catch (e) {}
